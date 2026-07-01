@@ -30,12 +30,12 @@ s6r-odoo-sh --install-browser           # download the Playwright browser (once)
 
 ```bash
 # one-time interactive login (opens a browser window)
-s6r-odoo-sh --login -p grandiflora BRANCH
+s6r-odoo-sh --login -p myproject BRANCH
 
 # current build of a branch (headless afterwards)
-s6r-odoo-sh migration_19_v1 -p grandiflora
-s6r-odoo-sh migration_19_v1 -p grandiflora --ssh-host   # host string only
-s6r-odoo-sh --list          -p grandiflora              # all branches
+s6r-odoo-sh migration_19_v1 -p myproject
+s6r-odoo-sh migration_19_v1 -p myproject --ssh-host   # host string only
+s6r-odoo-sh --list          -p myproject              # all branches
 
 # ODOO_SH_PROJECT / ODOO_SH_STATE env vars are honored as defaults
 ```
@@ -44,14 +44,14 @@ Example output:
 
 ```json
 {
-  "project": "grandiflora",
+  "project": "myproject",
   "branch": "migration_19_v1",
   "stage": "dev",
   "build_id": 34305175,
-  "host_slug": "grandiflora-migration-19-v1-34305175",
+  "host_slug": "myproject-migration-19-v1-34305175",
   "status": "done",
   "result": "success",
-  "ssh_host": "34305175@grandiflora-migration-19-v1-34305175.dev.odoo.com"
+  "ssh_host": "34305175@myproject-migration-19-v1-34305175.dev.odoo.com"
 }
 ```
 
@@ -61,13 +61,13 @@ Example output:
 from s6r_odoo_sh import OdooShClient, resolve
 
 # one-shot (auto-login on first use)
-build = resolve("grandiflora", "migration_19_v1")
+build = resolve("myproject", "migration_19_v1")
 print(build["build_id"], build["ssh_host"])
 
 # reusable client, custom session path
 client = OdooShClient(state_path="/path/to/state.json")
-host = client.get_ssh_host("grandiflora", "migration_19_v1", auto_login=True)
-for b in client.list_branches("grandiflora"):
+host = client.get_ssh_host("myproject", "migration_19_v1", auto_login=True)
+for b in client.list_branches("myproject"):
     print(b["name"], b["last_build_id"])
 ```
 
