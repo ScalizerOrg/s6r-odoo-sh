@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "s6r-odoo-sh"
+version = "0.1.0"
+description = "Resolve the current build (number + SSH host) of an odoo.sh branch from Python"
+readme = "README.md"
+authors = [{ name = "Michel Perrocheau", email = "michel@scalizer.fr" }]
+license = { file = "LICENSE" }
+classifiers = [
+    "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Framework :: Odoo",
+]
+keywords = ["odoo", "odoo.sh", "build", "ci", "devops", "ssh"]
+dependencies = [
+    "httpx>=0.27",
+]
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+login = ["playwright>=1.44"]
+dev = ["build", "twine", "bumpver", "pytest"]
+
+[project.scripts]
+s6r-odoo-sh = "s6r_odoo_sh.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ScalizerOrg/s6r-odoo-sh"
+Changelog = "https://github.com/ScalizerOrg/s6r-odoo-sh/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.bumpver]
+current_version = "0.1.0"
+version_pattern = "MAJOR.MINOR.PATCH"
+commit = true
+tag = true
+push = false
+
+[tool.bumpver.file_patterns]
+"pyproject.toml" = ['current_version = "{version}"', 'version = "{version}"']
+"src/s6r_odoo_sh/__init__.py" = ['__version__ = "{version}"']
+"CHANGELOG.md" = ['## {version}']
