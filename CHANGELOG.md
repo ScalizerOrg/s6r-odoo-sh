@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.0
+
+- `list_backups(project)`: repository backups via `paas.repository.get_backups_info_public`.
+- `create_backup(project, branch, comment="")`: persistent backup of a branch's current build
+  (`POST /build/<id>/dump {backup_only: true}`).
+- `create_dump(project, branch=None, dest=None, test_dump=True, filestore=False, build_id=None)`: full
+  async flow — triggers the dump, waits for the "Database dump ready" notification (authoritative
+  download URL), and downloads the ZIP (`dump.sql` + `filestore/`) to Downloads by default.
+- `download_ready_dump(project, dest=None, backup_datetime_utc=None, build_id=None)`: download an
+  already-prepared dump from the notifications, without triggering a new one.
+- Also `start_dump`, `dump_notifications`, `wait_for_dump`, `download_url`, `default_download_dir`.
+  Any build-targeting method accepts a `build_id` (else it resolves the branch's current build).
+- `build_status(project, branch)` and `wait_for_build(project, branch, after_build_id=None,
+  commit=None, on_start=None)`: watch a branch's build — wait for a (new) build to start after a
+  push, then for it to finish (build + unit tests), returning `{build_id, status, result,
+  status_info, commit, run_time}`.
+- CLI: `--backups`, `--dump-notifs`, `--create-backup` (`--comment`), `--create-dump [PATH]`,
+  `--download-dump [PATH]` (`--backup-datetime`), `--build-status`, `--wait-build` (`--commit`,
+  `--after-build`), `--build <id>`, `--filestore`, `--prod`, `--timeout`.
+
 ## 0.1.0
 
 Initial release.

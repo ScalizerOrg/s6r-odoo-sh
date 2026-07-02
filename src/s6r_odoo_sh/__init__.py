@@ -2,9 +2,9 @@
 # License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl.html).
 """s6r-odoo-sh: resolve the current build (number + SSH host) of an odoo.sh branch."""
 
-from .client import DEFAULT_BASE_URL, NeedLogin, OdooShClient, default_state_path
+from .client import DEFAULT_BASE_URL, NeedLogin, OdooShClient, default_download_dir, default_state_path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def resolve(project, branch, auto_login=True, **kwargs):
@@ -16,4 +16,5 @@ def resolve(project, branch, auto_login=True, **kwargs):
     return OdooShClient(**kwargs).get_branch(project, branch, auto_login=auto_login)
 
 
-__all__ = ["OdooShClient", "NeedLogin", "resolve", "default_state_path", "DEFAULT_BASE_URL", "__version__"]
+__all__ = ["OdooShClient", "NeedLogin", "resolve", "default_state_path", "default_download_dir",
+           "DEFAULT_BASE_URL", "__version__"]

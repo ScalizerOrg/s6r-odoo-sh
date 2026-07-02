@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "s6r-odoo-sh"
-version = "0.1.0"
+version = "0.2.0"
 description = "Resolve the current build (number + SSH host) of an odoo.sh branch from Python"
 readme = "README.md"
 authors = [{ name = "Michel Perrocheau", email = "michel@scalizer.fr" }]
@@ -36,7 +36,7 @@ Changelog = "https://github.com/ScalizerOrg/s6r-odoo-sh/blob/main/CHANGELOG.md"
 where = ["src"]
 
 [tool.bumpver]
-current_version = "0.1.0"
+current_version = "0.2.0"
 version_pattern = "MAJOR.MINOR.PATCH"
 commit = true
 tag = true
