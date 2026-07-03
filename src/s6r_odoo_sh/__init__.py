@@ -4,7 +4,7 @@
 
 from .client import DEFAULT_BASE_URL, NeedLogin, OdooShClient, default_download_dir, default_state_path
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 def resolve(project, branch, auto_login=True, **kwargs):

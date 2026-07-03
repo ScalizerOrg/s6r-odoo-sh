@@ -124,9 +124,15 @@ class OdooShClient:
         """Return only the SSH host string of the branch's current build, or None."""
         return (self.get_branch(project, branch, auto_login=auto_login) or {}).get("ssh_host")
 
-    def build_status(self, project, branch):
-        """Return the current build of ``branch``: ``{build_id, status, result, status_info,
-        commit, start_datetime, run_time}``."""
+    def build_status(self, project, branch, commit=None, build_id=None):
+        """Return a build of ``branch``: ``{build_id, status, result, status_info, commit,
+        start_datetime, run_time}``.
+
+        Selects the build matching ``build_id`` or ``commit`` within the branch's build list
+        and sources **every** field from that single build (falling back to the latest build,
+        then to ``branch_info``). This avoids mixing a build id from one build with the
+        status/commit of another — which diverge while a build is starting/finishing.
+        """
         with self._session() as client:
             repo_id = self._repository_id(client, project)
             result = self._json_call(client, "/project/json/builds_per_branch",
@@ -135,10 +141,17 @@ class OdooShClient:
             if not entry:
                 raise ValueError("branch %r not found in project %r" % (branch, project))
             bi = entry["branch_info"]
-            build = (entry.get("builds") or [{}])[0]
+            builds = entry.get("builds") or []
+            build = None
+            if build_id:
+                build = next((b for b in builds if b.get("id") == build_id), None)
+            elif commit:
+                build = next((b for b in builds if commit in (b.get("head_commit_url") or "")), None)
+            if build is None:
+                build = builds[0] if builds else {}
             result_value = build.get("result")
             return {
-                "build_id": (bi.get("last_build_id") or [None])[0],
+                "build_id": build.get("id") or (bi.get("last_build_id") or [None])[0],
                 "status": build.get("status") or bi.get("last_build_status"),
                 "result": result_value if result_value is not None else bi.get("last_build_result"),
                 "status_info": build.get("status_info"),
@@ -151,31 +164,33 @@ class OdooShClient:
                        timeout=1800, interval=10, on_start=None):
         """Wait for a build of ``branch`` to start, then finish (build + unit tests).
 
-        Waits until a build matching ``commit`` (or newer than ``after_build_id``, else the
-        current one) is present, calls ``on_start(build)`` once, then polls until the build
-        leaves a running state. Returns the final build info (see :meth:`build_status`).
-        Tracks the branch's latest build, which is what a single push produces.
+        Locates the target build (matching ``commit``, newer than ``after_build_id``, else the
+        latest) in the branch's build list, calls ``on_start(build)`` once, then tracks **that
+        specific build id** until it leaves a running state. Returns its final info. Tracking a
+        fixed build id (rather than ``builds[0]``) is robust while the build list reorders as
+        builds start/finish. Returns the final build info (see :meth:`build_status`).
         """
         deadline = time.monotonic() + timeout
-        build = None
-        while build is None:
-            current = self.build_status(project, branch)
-            bid = current.get("build_id") or 0
+        target_id = None
+        while target_id is None:
+            info = self.build_status(project, branch, commit=commit)
+            bid = info.get("build_id") or 0
             if bid and (after_build_id is None or bid > after_build_id) \
-                    and (not commit or commit in (current.get("commit") or "")):
-                build = current
+                    and (not commit or commit in (info.get("commit") or "")):
+                target_id = bid
                 if on_start:
-                    on_start(build)
+                    on_start(info)
                 break
             if time.monotonic() >= deadline:
                 raise TimeoutError("no matching build started for %r/%r within %ss" % (project, branch, timeout))
             time.sleep(interval)
-        while build.get("status") in _RUNNING_STATES:
+        while True:
+            info = self.build_status(project, branch, build_id=target_id)
+            if info.get("status") not in _RUNNING_STATES:
+                return info
             if time.monotonic() >= deadline:
-                raise TimeoutError("build %s did not finish within %ss" % (build.get("build_id"), timeout))
+                raise TimeoutError("build %s did not finish within %ss" % (target_id, timeout))
             time.sleep(interval)
-            build = self.build_status(project, branch)
-        return build
 
     def list_backups(self, project):
         """Return the repository's backups (``type``, ``backup_datetime_utc``, ``path``, …)."""

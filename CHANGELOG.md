@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+- Fix `build_status` / `wait_for_build`: source every field (id, status, commit) from a single
+  build in the branch's build list, selected by `build_id`/`commit`, instead of mixing a build id
+  from `branch_info` with the status/commit of `builds[0]`. `wait_for_build` now tracks the matched
+  build by its id until it finishes — previously, while the list reordered as builds start/finish,
+  the commit match could test the wrong build and never complete even though the target was done.
+
 ## 0.2.0
 
 - `list_backups(project)`: repository backups via `paas.repository.get_backups_info_public`.
