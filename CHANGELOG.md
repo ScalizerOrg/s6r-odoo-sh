@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.2
+
+- Port every dashboard call to odoo.sh's new `/app/*` JSON API. odoo.sh moved its
+  project portal to a JavaScript SPA (Odoo 18): the builds page is now an empty HTML
+  shell, so scraping `odoo.sh_repo_id` from the HTML broke with
+  `could not find repository id for project '<name>'` on **every** project (the repo
+  exists and the session is valid — the marker is simply gone). Resolution now uses
+  the SPA's own routes, with the public API and return shapes unchanged:
+  - repository via `POST /app/projects` (name → `id` + `technical_name`);
+  - branches via `POST /app/project/<technical_name>/branches`;
+  - builds via `POST /app/branch/<branch_id>/builds` — the SSH host is now derived
+    from the build URL (`<build_id>@<hostname>`) instead of a hard-coded
+    `.dev.odoo.com` slug, so it is correct across stages;
+  - backups via `POST /app/project/<technical_name>/backups`;
+  - dump / backup triggers via `POST /app/build/<build_id>/dump`;
+  - dump-ready notifications from the repository's `notification_counts`.
+- Move session-expiry detection into the `/app/*` layer (HTML shell / login redirect
+  or a `SessionExpired` JSON error → `NeedLogin`): the old builds-page redirect check
+  no longer applies, since the shell now returns `200` whether or not logged in.
+
 ## 0.2.1
 
 - Fix `build_status` / `wait_for_build`: source every field (id, status, commit) from a single

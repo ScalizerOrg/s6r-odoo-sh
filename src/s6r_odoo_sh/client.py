@@ -2,13 +2,19 @@
 # License LGPL-3.0 or later (https://www.gnu.org/licenses/lgpl.html).
 """httpx-based client for the odoo.sh dashboard JSON API.
 
-The odoo.sh dashboard is a GitHub-OAuth-gated Odoo instance whose generic
-``/web/dataset/call_kw`` is locked down (``paas_master`` restrict_api). This
-client uses the dashboard's own JSON routes instead:
+The odoo.sh dashboard is a GitHub-OAuth-gated Odoo instance. Its project portal
+is a JavaScript SPA (``paas_master``) served as an empty HTML shell; all data is
+fetched by the client through the dashboard's own ``/app/*`` JSON routes:
 
-* the authenticated builds page embeds ``odoo.sh_repo_id = <id>`` in its HTML;
-* ``POST /project/json/builds_per_branch {"repository_id": id}`` returns every
-  branch with ``last_build_id = [build_id, host_slug]``.
+* ``POST /app/projects`` → ``{hosting_user_id, repos: [{id, name, technical_name,
+  …}]}`` — the accessible projects (name → repo id / technical_name);
+* ``POST /app/project/<technical_name>/branches`` → every branch
+  (``id``, ``name``, ``stage``, ``last_build_id = [build_id, host_slug]``, …);
+* ``POST /app/branch/<branch_id>/builds`` → ``[{branch_info, builds: [{id, url,
+  status, result, …}]}]`` — the branch's builds (the SSH host is derived from
+  ``build.url``);
+* ``POST /app/build/<build_id>/dump`` — trigger a downloadable dump / backup;
+* ``POST /app/project/<technical_name>/backups`` — the repository backups.
 
 Runtime needs only httpx: it reuses a persisted browser session (Playwright
 ``storage_state``) and, if the odoo.sh session has expired but the GitHub
@@ -27,7 +33,6 @@ import httpx
 
 DEFAULT_BASE_URL = "https://www.odoo.sh"
 _UA = "Mozilla/5.0 (X11; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0"
-_REPO_ID_RE = re.compile(r"odoo\.sh_repo_id\s*=\s*(\d+)")
 _BUILD_IN_URL_RE = re.compile(r"/paas/build/(\d+)/")
 # States where a build is still building / running its unit tests (not finished).
 _RUNNING_STATES = frozenset({"pending", "queued", "waiting", "progress", "testing", "installing"})
@@ -100,25 +105,29 @@ class OdooShClient:
     def list_branches(self, project):
         """Return every branch of the project's repository (name, stage, last_build_id, status, result)."""
         with self._session() as client:
-            repo_id = self._repository_id(client, project)
-            resp = self._json_call(client, "/project/json/builds_per_branch", {"repository_id": repo_id})
+            repo = self._repo(client, project)
+            branches = self._app(client, "/app/project/%s/branches" % repo["technical_name"]) or []
             self._save_cookies(client)
-            return [self._branch(x.get("branch_info") or {}) for x in (resp.get("result") or [])]
+            return [self._branch(b) for b in branches]
 
     def get_branch(self, project, branch, auto_login=False):
         """Return the current build of ``branch`` (id, host slug, status, reconstructed SSH host)."""
         try:
-            branches = self.list_branches(project)
+            with self._session() as client:
+                repo = self._repo(client, project)
+                branches = self._app(client, "/app/project/%s/branches" % repo["technical_name"]) or []
+                entry = next((b for b in branches if b.get("name") == branch), None)
+                if entry is None:
+                    return {"error": "branch not found", "branch": branch,
+                            "available": sorted(b.get("name") for b in branches if b.get("name"))}
+                builds = self._builds(client, entry.get("id"))
+                self._save_cookies(client)
+                return self._build(project, self._branch(entry), builds)
         except NeedLogin:
             if not auto_login:
                 raise
             self.login(project)
-            branches = self.list_branches(project)
-        for entry in branches:
-            if entry.get("name") == branch:
-                return self._build(project, entry)
-        return {"error": "branch not found", "branch": branch,
-                "available": sorted(b["name"] for b in branches if b.get("name"))}
+            return self.get_branch(project, branch, auto_login=False)
 
     def get_ssh_host(self, project, branch, auto_login=False):
         """Return only the SSH host string of the branch's current build, or None."""
@@ -130,18 +139,16 @@ class OdooShClient:
 
         Selects the build matching ``build_id`` or ``commit`` within the branch's build list
         and sources **every** field from that single build (falling back to the latest build,
-        then to ``branch_info``). This avoids mixing a build id from one build with the
-        status/commit of another — which diverge while a build is starting/finishing.
+        then to the branch's ``last_build_*``). This avoids mixing a build id from one build
+        with the status/commit of another — which diverge while a build is starting/finishing.
         """
         with self._session() as client:
-            repo_id = self._repository_id(client, project)
-            result = self._json_call(client, "/project/json/builds_per_branch",
-                                     {"repository_id": repo_id})["result"]
-            entry = next((x for x in result if (x.get("branch_info") or {}).get("name") == branch), None)
+            repo = self._repo(client, project)
+            branches = self._app(client, "/app/project/%s/branches" % repo["technical_name"]) or []
+            entry = next((b for b in branches if b.get("name") == branch), None)
             if not entry:
                 raise ValueError("branch %r not found in project %r" % (branch, project))
-            bi = entry["branch_info"]
-            builds = entry.get("builds") or []
+            builds = self._builds(client, entry.get("id"))
             build = None
             if build_id:
                 build = next((b for b in builds if b.get("id") == build_id), None)
@@ -149,11 +156,12 @@ class OdooShClient:
                 build = next((b for b in builds if commit in (b.get("head_commit_url") or "")), None)
             if build is None:
                 build = builds[0] if builds else {}
+            last_build_id = entry.get("last_build_id") or [None]
             result_value = build.get("result")
             return {
-                "build_id": build.get("id") or (bi.get("last_build_id") or [None])[0],
-                "status": build.get("status") or bi.get("last_build_status"),
-                "result": result_value if result_value is not None else bi.get("last_build_result"),
+                "build_id": build.get("id") or last_build_id[0],
+                "status": build.get("status") or entry.get("last_build_status"),
+                "result": result_value if result_value is not None else entry.get("last_build_result"),
                 "status_info": build.get("status_info"),
                 "commit": build.get("head_commit_url"),
                 "start_datetime": build.get("start_datetime"),
@@ -193,17 +201,17 @@ class OdooShClient:
             time.sleep(interval)
 
     def list_backups(self, project):
-        """Return the repository's backups (``type``, ``backup_datetime_utc``, ``path``, …)."""
+        """Return the repository's backups (``type``, ``backup_datetime_utc``, ``branch``, ``path``, …)."""
         with self._session() as client:
-            repo_id = self._repository_id(client, project)
-            return self._call_kw(client, "paas.repository", "get_backups_info_public", [repo_id])
+            repo = self._repo(client, project)
+            return self._app(client, "/app/project/%s/backups" % repo["technical_name"]) or []
 
     def create_backup(self, project, branch=None, comment="", build_id=None):
         """Create a persistent backup of a build (``build_id`` or ``branch``'s current build)."""
         build_id = self._resolve_build_id(project, branch, build_id)
         with self._session() as client:
-            return self._json_call(client, "/build/%s/dump" % build_id,
-                                   {"backup_only": True, "comment": comment})["result"]
+            return self._app(client, "/app/build/%s/dump" % build_id,
+                             {"backup_only": True, "comment": comment})
 
     def start_dump(self, project, branch=None, test_dump=True, filestore=False,
                    backup_datetime_utc=None, build_id=None):
@@ -213,24 +221,23 @@ class OdooShClient:
         if backup_datetime_utc:
             params["backup_datetime_utc"] = backup_datetime_utc
         with self._session() as client:
-            return self._json_call(client, "/build/%s/dump" % build_id, params)["result"]
+            return self._app(client, "/app/build/%s/dump" % build_id, params)
 
     def dump_notifications(self, project):
         """Return the project's 'Database dump ready' notifications, oldest first.
 
         Each item is ``{id, create_date, name, url}`` where ``url`` is the ready-to-use
-        download link odoo.sh published (correct worker, build id and backup_datetime_utc).
+        download link odoo.sh published. The notifications are the repository's unseen
+        ``notification_counts.items`` (a dump raises one when it is ready to download).
         """
         with self._session() as client:
-            repo_id = self._repository_id(client, project)
-            init = self._json_call(client, "/project/json/init",
-                                   {"repository_id": repo_id, "customs_only": True})["result"]
-            entry = (init.get("notifications") or {}).get(str(repo_id)) or {}
+            repo = self._repo(client, project)
+            items = ((repo.get("notification_counts") or {}).get("items")) or []
             dumps = []
-            for item in entry.get("items", []):
+            for item in items:
                 if item.get("notif_type") != "dump":
                     continue
-                url = next((b.get("url") for b in (item.get("buttons") or []) if b.get("type") == "download"), None)
+                url = self._download_button_url(item)
                 if url:
                     dumps.append({"id": item.get("id"), "create_date": item.get("create_date"),
                                   "name": item.get("name"), "url": url})
@@ -339,34 +346,54 @@ class OdooShClient:
             cookies.set(c["name"], c["value"], domain=c["domain"].lstrip("."), path=c.get("path", "/"))
         return httpx.Client(cookies=cookies, follow_redirects=True, timeout=30, headers={"User-Agent": _UA})
 
-    def _repository_id(self, client, project):
-        r = client.get("%s/project/%s/builds" % (self.base_url, project))
-        if self._is_login_url(str(r.url)):
-            raise NeedLogin("session expired: %s" % r.url)
-        m = _REPO_ID_RE.search(r.text)
-        if not m:
-            raise RuntimeError("could not find repository id for project %r" % project)
-        return int(m.group(1))
+    def _app(self, client, route, params=None):
+        """POST a ``/app/*`` JSON-RPC route and return its ``result``.
 
-    def _json_call(self, client, route, params):
+        Raises :class:`NeedLogin` when the session is gone (odoo.sh answers with the HTML
+        SPA shell / a login redirect, or a SessionExpired JSON error) and :class:`RuntimeError`
+        on any other JSON error or unexpected (non-JSON) response.
+        """
         r = client.post(self.base_url + route,
-                        json={"id": 0, "jsonrpc": "2.0", "method": "call", "params": params})
+                        json={"jsonrpc": "2.0", "method": "call", "params": params or {}})
+        if "application/json" not in (r.headers.get("content-type") or ""):
+            if self._is_login_url(str(r.url)) or r.status_code in (200, 401, 403):
+                raise NeedLogin("session expired or not logged in: %s" % r.url)
+            raise RuntimeError("unexpected HTTP %s from %s (odoo.sh API changed?)" % (r.status_code, route))
         data = r.json()
         if data.get("error"):
             err = data["error"]
-            raise RuntimeError((err.get("data") or {}).get("message") or err.get("message") or str(err))
-        return data
+            edata = err.get("data") or {}
+            msg = edata.get("message") or err.get("message") or str(err)
+            if err.get("code") == 100 or "SessionExpired" in (edata.get("name") or "") \
+                    or "AccessDenied" in (edata.get("name") or ""):
+                raise NeedLogin(msg)
+            raise RuntimeError(msg)
+        return data.get("result")
 
-    def _call_kw(self, client, model, method, args=None, kwargs=None):
-        r = client.post(self.base_url + "/web/dataset/call_kw",
-                        json={"jsonrpc": "2.0", "method": "call",
-                              "params": {"model": model, "method": method,
-                                         "args": args or [], "kwargs": kwargs or {}}})
-        data = r.json()
-        if data.get("error"):
-            err = data["error"]
-            raise RuntimeError((err.get("data") or {}).get("message") or err.get("message") or str(err))
-        return data["result"]
+    def _repo(self, client, project):
+        """Return the accessible odoo.sh repo dict whose ``name`` is ``project``.
+
+        Raises :class:`NeedLogin` if the session is gone, or :class:`RuntimeError` if the
+        project is not among the account's accessible repositories.
+        """
+        repos = (self._app(client, "/app/projects") or {}).get("repos") or []
+        for repo in repos:
+            if repo.get("name") == project:
+                return repo
+        raise RuntimeError("could not find repository id for project %r" % project)
+
+    def _repository_id(self, client, project):
+        """Return the numeric odoo.sh repository id of ``project``."""
+        return self._repo(client, project)["id"]
+
+    def _builds(self, client, branch_id):
+        """Return the build list of a branch (``/app/branch/<id>/builds`` → ``builds``)."""
+        if not branch_id:
+            return []
+        res = self._app(client, "/app/branch/%s/builds" % branch_id)
+        if isinstance(res, list):
+            res = res[0] if res else {}
+        return (res or {}).get("builds") or []
 
     def _resolve_build_id(self, project, branch=None, build_id=None):
         """Return ``build_id`` if given, else the current build id of ``branch``."""
@@ -384,32 +411,67 @@ class OdooShClient:
 
     def _branch_build(self, client, project, branch):
         """Return ``(repo_id, build_id, worker_url)`` for a branch's current build."""
-        repo_id = self._repository_id(client, project)
-        result = self._json_call(client, "/project/json/builds_per_branch", {"repository_id": repo_id})["result"]
-        entry = next((x for x in result if (x.get("branch_info") or {}).get("name") == branch), None)
+        repo = self._repo(client, project)
+        branches = self._app(client, "/app/project/%s/branches" % repo["technical_name"]) or []
+        entry = next((b for b in branches if b.get("name") == branch), None)
         if not entry:
             raise ValueError("branch %r not found in project %r" % (branch, project))
-        build_id = entry["branch_info"]["last_build_id"][0]
-        builds = entry.get("builds") or []
+        build_id = (entry.get("last_build_id") or [None])[0]
+        builds = self._builds(client, entry.get("id"))
         worker_url = builds[0].get("worker_url") if builds else None
-        return repo_id, build_id, worker_url
+        return repo["id"], build_id, worker_url
 
     @staticmethod
     def _is_login_url(url):
         return "/web/login" in url or "github.com" in url or "/oauth/" in url
 
     @staticmethod
-    def _branch(bi):
-        return {"name": bi.get("name"), "stage": bi.get("stage"), "last_build_id": bi.get("last_build_id"),
-                "status": bi.get("last_build_status"), "result": bi.get("last_build_result")}
+    def _download_button_url(item):
+        """Return the download URL of a 'dump ready' notification, from its buttons."""
+        groups = []
+        if isinstance(item.get("buttons"), list):
+            groups.append(item["buttons"])
+        bottom_left = item.get("bottom_left") or {}
+        if isinstance(bottom_left.get("buttons"), list):
+            groups.append(bottom_left["buttons"])
+        for buttons in groups:
+            for b in buttons:
+                if not isinstance(b, dict):
+                    continue
+                url = b.get("url") or b.get("href") or b.get("link")
+                if url and (b.get("type") in (None, "download")
+                            or "download" in (b.get("name") or "").lower() or "dump" in url):
+                    return url
+        return None
 
-    def _build(self, project, entry):
-        build_id, slug = (list(entry.get("last_build_id") or []) + [None, None])[:2]
+    @staticmethod
+    def _branch(b):
+        """Normalize a ``/app/project/<tn>/branches`` entry to the public branch shape."""
+        return {"name": b.get("name"), "stage": b.get("stage"),
+                "branch_id": b.get("id"), "last_build_id": b.get("last_build_id"),
+                "status": b.get("last_build_status"), "result": b.get("last_build_result"),
+                "slug": b.get("slug")}
+
+    def _build(self, project, entry, builds=None):
+        """Build the public 'current build' dict, deriving the SSH host from the build URL.
+
+        ``entry`` is a normalized branch (see :meth:`_branch`); ``builds`` is its build list.
+        The SSH host is ``<build_id>@<hostname of build.url>``, falling back to the
+        ``last_build_id`` host slug on ``.dev.odoo.com`` when no build URL is available.
+        """
+        builds = builds or []
+        current = builds[0] if builds else {}
+        last_build_id = list(entry.get("last_build_id") or []) + [None, None]
+        build_id = current.get("id") or last_build_id[0]
+        slug = last_build_id[1]
+        url = current.get("url")
+        host = urlparse(url).hostname if url else ("%s.dev.odoo.com" % slug if slug else None)
         return {
             "project": project, "branch": entry.get("name"), "stage": entry.get("stage"),
             "build_id": build_id, "host_slug": slug,
-            "status": entry.get("status"), "result": entry.get("result"),
-            "ssh_host": "%s@%s.dev.odoo.com" % (build_id, slug) if build_id and slug else None,
+            "status": current.get("status") or entry.get("status"),
+            "result": current.get("result") or entry.get("result"),
+            "ssh_host": "%s@%s" % (build_id, host) if build_id and host else None,
         }
 
     def _load_state(self):
