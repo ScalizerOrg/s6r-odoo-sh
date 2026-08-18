@@ -8,7 +8,9 @@
   `could not find repository id for project '<name>'` on **every** project (the repo
   exists and the session is valid — the marker is simply gone). Resolution now uses
   the SPA's own routes, with the public API and return shapes unchanged:
-  - repository via `POST /app/projects` (name → `id` + `technical_name`);
+  - repository via `POST /app/projects`, matched by the odoo.sh **project name**
+    (`project_name`, i.e. scalidev's "odoo.sh project" setting) — not the GitHub repo
+    `name`, which can differ;
   - branches via `POST /app/project/<technical_name>/branches`;
   - builds via `POST /app/branch/<branch_id>/builds` — the SSH host is now derived
     from the build URL (`<build_id>@<hostname>`) instead of a hard-coded

@@ -371,12 +371,18 @@ class OdooShClient:
         return data.get("result")
 
     def _repo(self, client, project):
-        """Return the accessible odoo.sh repo dict whose ``name`` is ``project``.
+        """Return the accessible odoo.sh repo dict for the ``project`` name.
 
-        Raises :class:`NeedLogin` if the session is gone, or :class:`RuntimeError` if the
-        project is not among the account's accessible repositories.
+        ``project`` is the odoo.sh **project name** — the slug shown in the dashboard URL
+        and stored as scalidev's "odoo.sh project" setting — i.e. the API's ``project_name``
+        field, which is NOT the GitHub repo ``name`` (the two can differ). Falls back to
+        matching the GitHub ``name`` for older configs. Raises :class:`NeedLogin` if the
+        session is gone, or :class:`RuntimeError` if no accessible repository matches.
         """
         repos = (self._app(client, "/app/projects") or {}).get("repos") or []
+        for repo in repos:
+            if repo.get("project_name") == project:
+                return repo
         for repo in repos:
             if repo.get("name") == project:
                 return repo
