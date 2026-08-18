@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "s6r-odoo-sh"
-version = "0.2.2"
+version = "0.2.3"
 description = "Resolve the current build (number + SSH host) of an odoo.sh branch from Python"
 readme = "README.md"
 authors = [{ name = "Michel Perrocheau", email = "michel@scalizer.fr" }]
