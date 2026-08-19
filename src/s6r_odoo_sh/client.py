@@ -27,7 +27,7 @@ import json
 import os
 import re
 import time
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 
@@ -205,6 +205,47 @@ class OdooShClient:
         with self._session() as client:
             repo = self._repo(client, project)
             return self._app(client, "/app/project/%s/backups" % repo["technical_name"]) or []
+
+    def get_backup_download_url(self, project, branch, backup_datetime_utc, test_dump=True,
+                                filestore=False, build_id=None):
+        """Build the direct download URL for an *already existing* backup — no trigger, no wait.
+
+        A backup returned by :meth:`list_backups` with ``downloadable: True`` can be fetched
+        straight away: odoo.sh's own "Download" button for such a row builds this same URL
+        (``{worker_url}/paas/build/{build_id}/download/dump?...``) purely from data already on
+        the branch's current build (``worker_url``), with no ``POST /app/build/<id>/dump`` call —
+        that call *generates a new dump* and must be reserved for backups that are not yet
+        downloadable (see :meth:`start_dump`).
+        """
+        with self._session() as client:
+            repo = self._repo(client, project)
+            branches = self._app(client, "/app/project/%s/branches" % repo["technical_name"]) or []
+            entry = next((b for b in branches if b.get("name") == branch), None)
+            if not entry:
+                raise ValueError("branch %r not found in project %r" % (branch, project))
+            builds = self._builds(client, entry.get("id"))
+            build = next((b for b in builds if b.get("id") == build_id), None) if build_id else None
+            if build is None:
+                build = builds[0] if builds else {}
+            worker_url = build.get("worker_url")
+            resolved_build_id = build.get("id")
+            if not worker_url or not resolved_build_id:
+                raise RuntimeError("could not resolve worker_url/build_id for %r/%r" % (project, branch))
+        params = "backup_datetime_utc=%s&test_dump=%d&filestore=%d" % (
+            quote(backup_datetime_utc), int(bool(test_dump)), int(bool(filestore)))
+        return "%s/paas/build/%s/download/dump?%s" % (worker_url, resolved_build_id, params)
+
+    def download_backup(self, project, branch, backup_datetime_utc, dest=None, test_dump=True,
+                        filestore=False, build_id=None):
+        """Download an already-existing, already-downloadable backup — no dump triggered, no wait.
+
+        See :meth:`get_backup_download_url`. Returns ``{url, dest, backup_datetime_utc}``.
+        """
+        url = self.get_backup_download_url(project, branch, backup_datetime_utc, test_dump=test_dump,
+                                           filestore=filestore, build_id=build_id)
+        target = self._resolve_dest(dest, project, branch, {"backup_datetime_utc": backup_datetime_utc})
+        self.download_url(url, target)
+        return {"url": url, "dest": target, "backup_datetime_utc": backup_datetime_utc}
 
     def create_backup(self, project, branch=None, comment="", build_id=None):
         """Create a persistent backup of a build (``build_id`` or ``branch``'s current build)."""
