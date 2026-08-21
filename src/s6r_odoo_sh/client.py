@@ -268,12 +268,16 @@ class OdooShClient:
         """Return the project's 'Database dump ready' notifications, oldest first.
 
         Each item is ``{id, create_date, name, url}`` where ``url`` is the ready-to-use
-        download link odoo.sh published. The notifications are the repository's unseen
-        ``notification_counts.items`` (a dump raises one when it is ready to download).
+        download link odoo.sh published. Notifications (dump-ready and otherwise, both seen
+        and unseen — odoo.sh keeps them all) come from ``/app/project/<project>/get_info``'s
+        ``notifications[<repo_id>].items``. ``/app/projects``' own ``notification_counts``
+        (used by :meth:`_repo`) only ever carries accurate *counts* — its ``items`` list is
+        always empty — so it cannot be used to resolve an actual download URL.
         """
         with self._session() as client:
-            repo = self._repo(client, project)
-            items = ((repo.get("notification_counts") or {}).get("items")) or []
+            info = self._app(client, "/app/project/%s/get_info" % project) or {}
+            repo_id = (info.get("active_repo") or {}).get("id")
+            items = ((info.get("notifications") or {}).get(str(repo_id)) or {}).get("items") or []
             dumps = []
             for item in items:
                 if item.get("notif_type") != "dump":
@@ -432,13 +436,18 @@ class OdooShClient:
         return self._repo(client, project)["id"]
 
     def _builds(self, client, branch_id):
-        """Return the build list of a branch (``/app/branch/<id>/builds`` → ``builds``)."""
+        """Return the build list of a branch (``/app/branch/<id>/builds`` → ``builds``),
+        newest first — a branch built against multiple Odoo versions in parallel can have
+        several builds in flight at once, so callers picking ``builds[0]`` as "the current
+        build" must not rely on the API's own ordering.
+        """
         if not branch_id:
             return []
         res = self._app(client, "/app/branch/%s/builds" % branch_id)
         if isinstance(res, list):
             res = res[0] if res else {}
-        return (res or {}).get("builds") or []
+        builds = (res or {}).get("builds") or []
+        return sorted(builds, key=lambda b: b.get("id") or 0, reverse=True)
 
     def _resolve_build_id(self, project, branch=None, build_id=None):
         """Return ``build_id`` if given, else the current build id of ``branch``."""

@@ -26,6 +26,29 @@ pip install "s6r-odoo-sh[login]"        # + Playwright, for the one-time login
 s6r-odoo-sh --install-browser           # download the Playwright browser (once)
 ```
 
+### Developing against a consumer project (editable install)
+
+When working on this package alongside a project that depends on it (e.g.
+`scalidev`), install it in **editable mode** from this checkout instead of a
+published release:
+
+```bash
+pip install -e ~/Projects/Interne/s6r-odoo-sh
+```
+
+This points the consumer's Python environment straight at this repo's
+`src/s6r_odoo_sh/` — no copy is made into `site-packages/`. Any edit made here
+takes effect the next time a process in that environment imports the package
+(just restart it; no `pip install` needed after the first time). Check with:
+
+```bash
+pip show s6r-odoo-sh   # look for "Editable project location: ..."
+```
+
+To go back to the published version pinned in the consumer's
+`requirements.txt`, reinstall normally there (e.g.
+`pip install --no-build-isolation -r requirements.txt`).
+
 ## CLI
 
 ```bash
