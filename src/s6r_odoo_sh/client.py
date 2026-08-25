@@ -472,7 +472,11 @@ class OdooShClient:
             raise ValueError("branch %r not found in project %r" % (branch, project))
         build_id = (entry.get("last_build_id") or [None])[0]
         builds = self._builds(client, entry.get("id"))
-        worker_url = builds[0].get("worker_url") if builds else None
+        # worker_url must come from the SAME build as build_id — builds[0] can be a
+        # higher-id but no-longer-live build (status "dropped"/"killed"), which would
+        # otherwise pair the right build_id with the wrong (dead) worker.
+        match = next((b for b in builds if b.get("id") == build_id), None)
+        worker_url = (match or (builds[0] if builds else {})).get("worker_url")
         return repo["id"], build_id, worker_url
 
     @staticmethod
@@ -514,8 +518,13 @@ class OdooShClient:
         ``last_build_id`` host slug on ``.dev.odoo.com`` when no build URL is available.
         """
         builds = builds or []
-        current = builds[0] if builds else {}
         last_build_id = list(entry.get("last_build_id") or []) + [None, None]
+        # entry's own last_build_id is odoo.sh's authoritative "current build" for this
+        # branch — a branch can have several builds in its build list that are no longer
+        # live (status "dropped"/"killed") yet still sort ahead by id, so builds[0] is only
+        # a fallback, never trusted over an actual last_build_id match.
+        current = next((b for b in builds if b.get("id") == last_build_id[0]), None) \
+            or (builds[0] if builds else {})
         build_id = current.get("id") or last_build_id[0]
         slug = last_build_id[1]
         url = current.get("url")
