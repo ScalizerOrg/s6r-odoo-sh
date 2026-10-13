@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.8.1
+
+- `get_monitoring_snapshot`: `database`/`slowest_routes_daily`/`slowest_routes_weekly` are now
+  lists of `{table, size_mb, index_mb, toast_mb}`/`{route, count, max_s}` dicts (parsed out of
+  odoo.sh's mixed text/number keys) instead of raw string-keyed mappings. `filestore` is capped
+  to its 10 largest mimetypes plus one `"other (N types)"` entry summing the rest. The `pad`/`pa`
+  `time` field is always an int (odoo.sh returns it as a float). odoo.sh's own `error_messages`
+  key is dropped (always empty).
+- `get_monitoring_annotations`: results are sorted deploys first (newest to oldest), then
+  retention notices (newest to oldest).
+- Branch-validation errors (`get_monitoring_metrics`/`_snapshot`/`_annotations` on an unknown or
+  dev branch) now raise `BranchNotFoundError`/`MonitorUnavailableError` (subclasses of
+  `ValueError`, so existing `except ValueError` callers keep working) instead of a bare
+  `ValueError`. A not-found error includes the closest-matching branch names and the
+  project's monitorable (production/staging) branches, instead of every branch name.
+
 ## 0.2.8
 
 - `get_monitoring_metrics(project, branch, start, end, build_id=None, scopes=("pad", "pa"))`:

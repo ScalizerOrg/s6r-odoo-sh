@@ -42,6 +42,7 @@ and requires the optional ``login`` extra (Playwright).
 """
 
 import datetime
+import difflib
 import json
 import os
 import re
@@ -64,6 +65,11 @@ _DB_TABLE_KEY_RE = re.compile(r"^(?P<table>.+) \(index=(?P<index>[\d.]+) (?P<ind
                               r"toast=(?P<toast>[\d.]+) (?P<toast_unit>\w+)\)$")
 # "<mimetype> (file count=186307)" -> mimetype / file count, as found in query/global's "filestore" dict.
 _FILESTORE_KEY_RE = re.compile(r"^(?P<mimetype>.+) \(file count=(?P<count>\d+)\)$")
+# "<route> (count=186)" -> route / request count, as found in query/global's "slowest_routes_*" dict
+# (value is the max execution time in seconds, per the dashboard's own fieldConfig.unit: "s").
+_ROUTE_COUNT_KEY_RE = re.compile(r"^(?P<route>.+) \(count=(?P<count>\d+)\)$")
+# Stages whose branches have an active Monitor tab worth suggesting on a "branch not found" error.
+_MONITORABLE_STAGES = ("production", "staging")
 # Grafana's declared unit for every storage/database/filestore panel (fieldConfig.unit: "kbytes")
 # — confirmed from the dashboard's own JSON definition, not a guess.
 _KB_TO_MB = 1024.0
@@ -118,6 +124,37 @@ def _split_filestore_key(key, size_kb):
         return {"mimetype": key, "size_mb": _kb_to_mb(size_kb)}
     return {"mimetype": m.group("mimetype"), "file_count": int(m.group("count")),
             "size_mb": _kb_to_mb(size_kb)}
+
+
+def _top_n_filestore(entries, n=10):
+    """Keep the ``n`` largest filestore entries (by size) and fold the rest into "other"."""
+    ordered = sorted(entries, key=lambda e: e["size_mb"], reverse=True)
+    if len(ordered) <= n:
+        return ordered
+    head, tail = ordered[:n], ordered[n:]
+    head.append({"mimetype": "other (%d types)" % len(tail), "file_count": sum(e["file_count"] for e in tail),
+                "size_mb": round(sum(e["size_mb"] for e in tail), 2)})
+    return head
+
+
+def _split_route_key(key, max_seconds):
+    """Parse a ``query/global`` "slowest_routes_*" key into ``{route, count, max_s}``."""
+    m = _ROUTE_COUNT_KEY_RE.match(key)
+    if not m:
+        return {"route": key, "max_s": max_seconds}
+    return {"route": m.group("route"), "count": int(m.group("count")), "max_s": max_seconds}
+
+
+class BranchMonitoringError(ValueError):
+    """Base for the branch-validation errors raised by ``_resolve_monitoring_build_id_checked``."""
+
+
+class BranchNotFoundError(BranchMonitoringError):
+    """The branch doesn't exist in the project at all."""
+
+
+class MonitorUnavailableError(BranchMonitoringError):
+    """The branch exists but has no monitoring build (e.g. most dev branches)."""
 
 
 def _parse_dump_url(url):
@@ -288,7 +325,9 @@ class OdooShClient:
             result = {"build_id": build_id}
             for scope in scopes:
                 rows = (self._app(client, "/_grafana/query/%s" % scope, params) or {}).get("data") or []
-                rows = [row for row in rows if start_ts <= row["time"] < end_ts]
+                # odoo.sh returns "time" as a float even though it's always a whole millisecond
+                # count — normalize to int (pad already comes back as int, pa doesn't).
+                rows = [dict(row, time=int(row["time"])) for row in rows if start_ts <= row["time"] < end_ts]
                 durations = [row["duration_sum"] for row in rows if "duration_sum" in row]
                 if durations:
                     # Bucket width adapts to the requested range (confirmed live: ~300s over a
@@ -319,20 +358,24 @@ class OdooShClient:
         "now"-relative.
 
         Returns ``{"database": [...], "storage": {...}, "filestore": [...], "log_counter_daily":
-        {...}, "log_counter_weekly": {...}, "slowest_routes_daily": {...},
-        "slowest_routes_weekly": {...}, "error_messages": {...}, "timestamp": str}``.
+        {...}, "log_counter_weekly": {...}, "slowest_routes_daily": [...],
+        "slowest_routes_weekly": [...], "timestamp": str}``. odoo.sh's own ``error_messages``
+        key is dropped — confirmed always empty ``{}`` across every branch/build tested.
         ``storage`` sizes (``filestore_size``/``database_size``/...) are converted from odoo.sh's
         raw kilobytes (confirmed from the dashboard's own ``fieldConfig.unit: "kbytes"``) to
-        megabytes, in ``*_mb``-suffixed keys. ``database``/``filestore`` are lists of
-        ``{table/mimetype, size_mb, index_mb, toast_mb}``/``{mimetype, file_count, size_mb}``
-        dicts (parsed out of odoo.sh's mixed text/number keys) instead of odoo.sh's raw
-        ``"<table> (index=X MB,toast=Y MB)": size`` mapping. ``timestamp`` is ISO-8601 UTC.
+        megabytes, in ``*_mb``-suffixed keys. ``database``/``slowest_routes_*`` are lists of
+        ``{table, size_mb, index_mb, toast_mb}``/``{route, count, max_s}`` dicts (parsed out of
+        odoo.sh's mixed text/number keys) instead of its raw ``"<table> (index=X MB,toast=Y
+        MB)": size`` mapping. ``filestore`` is the same kind of list, kept to its 10 largest
+        mimetypes plus one ``"other (N types)"`` entry summing the rest (odoo.sh returns ~35
+        mimetypes, most negligible). ``timestamp`` is ISO-8601 UTC.
 
-        ``slowest_routes_daily``/``slowest_routes_weekly`` route keys can carry a live request's
+        ``slowest_routes_daily``/``slowest_routes_weekly`` route names can carry a live request's
         full query string (e.g. ``/auth_oauth/signin?access_token=...``), which has been observed
         to include real OAuth tokens and end-user identities. ``redact=True`` (default) strips
-        the query string from every route key before returning. These dicts also carry a spurious
-        Grafana header row (``"Route": "Max execution time (Execution count)"``), dropped here.
+        the query string from every route name before returning. These lists also carry a
+        spurious Grafana header row (``"Route": "Max execution time (Execution count)"``),
+        dropped here.
         """
         with self._session() as client:
             if build_id is None:
@@ -347,7 +390,9 @@ class OdooShClient:
         for key in ("slowest_routes_daily", "slowest_routes_weekly"):
             routes = dict(result.get(key) or {})
             routes.pop("Route", None)
-            result[key] = _redact_routes(routes) if redact else routes
+            if redact:
+                routes = _redact_routes(routes)
+            result[key] = [_split_route_key(k, v) for k, v in routes.items()]
 
         storage = dict(result.get("storage") or {})
         for key in ("filestore_size", "database_size", "logs_size", "remaining_size",
@@ -357,7 +402,9 @@ class OdooShClient:
         result["storage"] = storage
 
         result["database"] = [_split_database_key(k, v) for k, v in (result.get("database") or {}).items()]
-        result["filestore"] = [_split_filestore_key(k, v) for k, v in (result.get("filestore") or {}).items()]
+        filestore = [_split_filestore_key(k, v) for k, v in (result.get("filestore") or {}).items()]
+        result["filestore"] = _top_n_filestore(filestore)
+        result.pop("error_messages", None)
 
         if "timestamp" in result:
             result["timestamp"] = _to_iso_utc(result["timestamp"])
@@ -377,12 +424,14 @@ class OdooShClient:
         confirmed live: a 2h window still returns retention notices from weeks earlier. This
         method filters the response to ``[start, end)`` before returning it.
 
-        Returns a list of ``{"time": str (ISO UTC), "text": str, "color": str}``. ``text``
-        contains raw HTML (``<a>``/``<li>`` links to the GitHub commit/PR). Two kinds of
-        annotations are mixed together: real deploys (commit/PR info) and, with
-        ``color == RETENTION_NOTICE_COLOR`` (module constant, ``"#2596be"``), system notices that
-        the data before that point in time has been aggregated to a coarser resolution — not a
-        deploy, treat it as a retention boundary instead.
+        Returns a list of ``{"time": str (ISO UTC), "text": str, "color": str}``, **deploys first
+        (most recent to oldest), then retention notices (most recent to oldest)** — odoo.sh
+        itself returns them in no particular order. ``text`` contains raw HTML (``<a>``/``<li>``
+        links to the GitHub commit/PR). Two kinds of annotations are mixed together: real deploys
+        (commit/PR info) and, with ``color == RETENTION_NOTICE_COLOR`` (module constant,
+        ``"#2596be"``), system notices that the data before that point in time has been
+        aggregated to a coarser resolution — not a deploy, treat it as a retention boundary
+        instead.
         """
         start_ts, end_ts = _to_epoch_ms(start), _to_epoch_ms(end)
         with self._session() as client:
@@ -391,8 +440,13 @@ class OdooShClient:
             params = {"build_id": build_id, "start_ts": start_ts, "end_ts": end_ts}
             result = self._app(client, "/_grafana/annotations", params) or {}
             self._save_cookies(client)
-        annotations = result.get("annotations") or []
-        return [dict(a, time=_to_iso_utc(a["time"])) for a in annotations if start_ts <= a["time"] < end_ts]
+        annotations = [dict(a, time=_to_iso_utc(a["time"])) for a in (result.get("annotations") or [])
+                       if start_ts <= a["time"] < end_ts]
+        deploys = sorted((a for a in annotations if a["color"] != RETENTION_NOTICE_COLOR),
+                         key=lambda a: a["time"], reverse=True)
+        notices = sorted((a for a in annotations if a["color"] == RETENTION_NOTICE_COLOR),
+                         key=lambda a: a["time"], reverse=True)
+        return deploys + notices
 
     def wait_for_build(self, project, branch, after_build_id=None, commit=None,
                        timeout=1800, interval=10, on_start=None):
@@ -616,18 +670,32 @@ class OdooShClient:
 
     def _resolve_monitoring_build_id_checked(self, client, project, branch, build=None):
         """Like :meth:`_resolve_monitoring_build_id`, but replaces odoo.sh's opaque ``SH-xxxxx``
-        server error with an explicit message when the branch doesn't exist or has no monitoring
-        build (e.g. a dev branch) — confirmed live on both cases.
+        server error with a :class:`BranchNotFoundError`/:class:`MonitorUnavailableError` when
+        the branch doesn't exist or has no monitoring build (e.g. a dev branch) — confirmed live
+        on both cases. Fetches the branch list itself (rather than :meth:`get_branch`, whose
+        "branch not found" payload only carries bare names) so the error can suggest the closest
+        matches and the monitorable (production/staging) branches, instead of dumping every
+        branch name — a project can have hundreds of dev branches (confirmed live: ~600 on one
+        project), which blew past 8000 characters in a flat list.
         """
         try:
             return self._resolve_monitoring_build_id(client, project, branch, build=build)
         except RuntimeError:
-            info = self.get_branch(project, branch)
-            if info.get("error"):
-                raise ValueError("branch %r not found in project %r (available: %s)" % (
-                    branch, project, ", ".join(info.get("available") or []))) from None
-            if info.get("stage") == "dev":
-                raise ValueError("Monitor unavailable for dev branch %r (no monitoring build)" % branch) from None
+            repo = self._repo(client, project)
+            branches = self._app(client, "/app/project/%s/branches" % repo["technical_name"]) or []
+            entry = next((b for b in branches if b.get("name") == branch), None)
+            if entry is None:
+                names = sorted(b.get("name") for b in branches if b.get("name"))
+                closest = difflib.get_close_matches(branch, names, n=5)
+                monitorable = sorted(b.get("name") for b in branches if b.get("stage") in _MONITORABLE_STAGES)
+                raise BranchNotFoundError(
+                    "branch %r not found in project %r (%d branches total; closest matches: %s; "
+                    "monitorable production/staging branches: %s)" % (
+                        branch, project, len(names), ", ".join(closest) or "none",
+                        ", ".join(monitorable) or "none")) from None
+            if entry.get("stage") == "dev":
+                raise MonitorUnavailableError(
+                    "Monitor unavailable for dev branch %r (no monitoring build)" % branch) from None
             raise
 
     def _repo(self, client, project):
