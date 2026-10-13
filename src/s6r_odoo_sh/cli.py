@@ -3,12 +3,19 @@
 """Command-line interface for s6r-odoo-sh."""
 
 import argparse
+import datetime
 import json
 import os
 import subprocess
 import sys
 
 from .client import DEFAULT_BASE_URL, OdooShClient
+
+
+def _parse_dt(value):
+    """Parse an ISO date/datetime CLI argument, assuming UTC when no timezone is given."""
+    dt = datetime.datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
 
 
 def main(argv=None):
@@ -48,6 +55,18 @@ def main(argv=None):
     parser.add_argument("--after-build", type=int, help="wait for a build newer than this id (with --wait-build)")
     parser.add_argument("--install-browser", action="store_true",
                         help="download the Playwright browser needed for login, then exit")
+    parser.add_argument("--monitoring-metrics", action="store_true",
+                        help="print the Monitor tab's time-series metrics (CPU/memory/IOPS/HTTP/mail) "
+                             "for --from/--to")
+    parser.add_argument("--monitoring-snapshot", action="store_true",
+                        help="print the Monitor tab's point-in-time snapshot (storage, log counters, "
+                             "slowest routes) -- always 'last 24h/7 days', --from/--to are ignored")
+    parser.add_argument("--monitoring-annotations", action="store_true",
+                        help="print the Monitor tab's deploy/build annotations for --from/--to")
+    parser.add_argument("--from", dest="date_from", help="ISO date/datetime, UTC if no timezone given "
+                                                          "(--monitoring-metrics/--monitoring-annotations)")
+    parser.add_argument("--to", dest="date_to", help="ISO date/datetime, UTC if no timezone given "
+                                                      "(--monitoring-metrics/--monitoring-annotations)")
     args = parser.parse_args(argv)
 
     if args.install_browser:
@@ -101,6 +120,29 @@ def main(argv=None):
 
     if not args.branch:
         parser.error("a branch is required (or use --list / --backups / --dump-notifs)")
+
+    if args.monitoring_metrics:
+        if not (args.date_from and args.date_to):
+            parser.error("--monitoring-metrics needs --from and --to")
+        result = client.get_monitoring_metrics(args.project, args.branch,
+                                               _parse_dt(args.date_from), _parse_dt(args.date_to),
+                                               build_id=args.build)
+        print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+        return 0
+
+    if args.monitoring_snapshot:
+        result = client.get_monitoring_snapshot(args.project, args.branch, build_id=args.build)
+        print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+        return 0
+
+    if args.monitoring_annotations:
+        if not (args.date_from and args.date_to):
+            parser.error("--monitoring-annotations needs --from and --to")
+        result = client.get_monitoring_annotations(args.project, args.branch,
+                                                    _parse_dt(args.date_from), _parse_dt(args.date_to),
+                                                    build_id=args.build)
+        print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+        return 0
 
     if args.build_status:
         print(json.dumps(client.build_status(args.project, args.branch), indent=2, default=str, ensure_ascii=False))

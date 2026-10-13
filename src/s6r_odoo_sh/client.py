@@ -16,6 +16,24 @@ fetched by the client through the dashboard's own ``/app/*`` JSON routes:
 * ``POST /app/build/<build_id>/dump`` — trigger a downloadable dump / backup;
 * ``POST /app/project/<technical_name>/backups`` — the repository backups.
 
+The Monitor tab is a separate, reverse-proxied Grafana instance, fetched through its own
+routes instead (same cookie-based session, no additional auth):
+
+* ``POST /_grafana/search`` → resolve a branch to its current monitoring build id;
+* ``POST /_grafana/query/pad`` / ``POST /_grafana/query/pa`` → time-series metrics
+  (CPU/memory/IOPS/HTTP/mail; database/container/toast size);
+* ``POST /_grafana/query/global`` → point-in-time snapshot (storage/filestore/database
+  breakdown, log error/warning/memory-limit counts, slowest routes) — always relative to
+  *now*, regardless of any requested time range, and refreshed only every ~24h;
+* ``POST /_grafana/annotations`` → deploy/build markers and retention/aggregation
+  notices (same ``{build_id, start_ts, end_ts}`` params as the ``query/*`` routes).
+
+Confirmed live against the dashboard's own JSON definition
+(``GET /monitoring/api/public/dashboards/<uid>``): only these three scopes
+(``pad``/``pa``/``global``) exist, and odoo.sh/Grafana itself never re-buckets
+these series for a wider time range or zoom level — every panel plots the raw
+points returned by the API as-is.
+
 Runtime needs only httpx: it reuses a persisted browser session (Playwright
 ``storage_state``) and, if the odoo.sh session has expired but the GitHub
 session is still alive, the GitHub OAuth code flow replays transparently while
@@ -23,6 +41,7 @@ following redirects. The interactive first login lives in :mod:`s6r_odoo_sh.logi
 and requires the optional ``login`` extra (Playwright).
 """
 
+import datetime
 import json
 import os
 import re
@@ -36,6 +55,69 @@ _UA = "Mozilla/5.0 (X11; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0"
 _BUILD_IN_URL_RE = re.compile(r"/paas/build/(\d+)/")
 # States where a build is still building / running its unit tests (not finished).
 _RUNNING_STATES = frozenset({"pending", "queued", "waiting", "progress", "testing", "installing"})
+# Matches a route logged with its query string, e.g. "/auth_oauth/signin?access_token=... (count=1)",
+# as found in query/global's slowest_routes_* — the query string can carry live OAuth tokens/PII.
+_ROUTE_QUERY_RE = re.compile(r"^([^?\s]+)\?[^\s]*(\s*\(count=\d+\))$")
+# "<table> (index=291 MB,toast=47 MB)" -> table / index size+unit / toast size+unit, as found in
+# query/global's "database" dict.
+_DB_TABLE_KEY_RE = re.compile(r"^(?P<table>.+) \(index=(?P<index>[\d.]+) (?P<index_unit>\w+),"
+                              r"toast=(?P<toast>[\d.]+) (?P<toast_unit>\w+)\)$")
+# "<mimetype> (file count=186307)" -> mimetype / file count, as found in query/global's "filestore" dict.
+_FILESTORE_KEY_RE = re.compile(r"^(?P<mimetype>.+) \(file count=(?P<count>\d+)\)$")
+# Grafana's declared unit for every storage/database/filestore panel (fieldConfig.unit: "kbytes")
+# — confirmed from the dashboard's own JSON definition, not a guess.
+_KB_TO_MB = 1024.0
+_UNIT_TO_MB = {"KB": 1 / 1024.0, "MB": 1.0, "GB": 1024.0}
+# Color of the "data before this period has been aggregated" system notices mixed into
+# /_grafana/annotations — distinguishes them from real deploy markers (confirmed live).
+RETENTION_NOTICE_COLOR = "#2596be"
+
+
+def _to_epoch_ms(value):
+    """Return ``value`` as an epoch-milliseconds int (accepts a ``datetime`` or a number)."""
+    if isinstance(value, datetime.datetime):
+        return int(value.timestamp() * 1000)
+    return int(value)
+
+
+def _to_iso_utc(epoch_ms):
+    """Return an epoch-milliseconds timestamp as an ISO-8601 UTC string."""
+    return datetime.datetime.fromtimestamp(epoch_ms / 1000, tz=datetime.timezone.utc).isoformat()
+
+
+def _redact_routes(routes):
+    """Strip query strings from ``slowest_routes_*`` keys (may carry live tokens/PII)."""
+    return {_ROUTE_QUERY_RE.sub(r"\1\2", route): v for route, v in (routes or {}).items()}
+
+
+def _kb_to_mb(value_kb):
+    """Convert a raw kilobyte value (as returned by odoo.sh) to megabytes, rounded."""
+    return round(value_kb / _KB_TO_MB, 2)
+
+
+def _split_database_key(key, size_kb):
+    """Parse a ``query/global`` "database" key into ``{table, size_mb, index_mb, toast_mb}``.
+
+    odoo.sh formats the key as ``"<table> (index=X <unit>,toast=Y <unit>)"``, with the unit
+    varying per row (KB/MB/GB) — confirmed live (e.g. ``toast=224 KB`` next to ``toast=7 GB``).
+    Falls back to a bare ``{table, size_mb}`` for rows that don't match (e.g. "Other Tables").
+    """
+    m = _DB_TABLE_KEY_RE.match(key)
+    if not m:
+        return {"table": key, "size_mb": _kb_to_mb(size_kb)}
+    index_mb = float(m.group("index")) * _UNIT_TO_MB[m.group("index_unit")]
+    toast_mb = float(m.group("toast")) * _UNIT_TO_MB[m.group("toast_unit")]
+    return {"table": m.group("table"), "size_mb": _kb_to_mb(size_kb),
+            "index_mb": round(index_mb, 2), "toast_mb": round(toast_mb, 2)}
+
+
+def _split_filestore_key(key, size_kb):
+    """Parse a ``query/global`` "filestore" key into ``{mimetype, file_count, size_mb}``."""
+    m = _FILESTORE_KEY_RE.match(key)
+    if not m:
+        return {"mimetype": key, "size_mb": _kb_to_mb(size_kb)}
+    return {"mimetype": m.group("mimetype"), "file_count": int(m.group("count")),
+            "size_mb": _kb_to_mb(size_kb)}
 
 
 def _parse_dump_url(url):
@@ -167,6 +249,150 @@ class OdooShClient:
                 "start_datetime": build.get("start_datetime"),
                 "run_time": build.get("run_time"),
             }
+
+    def get_monitoring_metrics(self, project, branch, start, end, build_id=None, scopes=("pad", "pa")):
+        """Return the Monitor tab's time-series metrics for ``branch`` over ``[start, end]``.
+
+        ``start``/``end`` accept a :class:`datetime.datetime` or an epoch-milliseconds number.
+        Behind odoo.sh's Monitor tab is a reverse-proxied Grafana instance (``/_grafana/*``) fed
+        by two time-series "scopes": ``pad`` (~5 min buckets — CPU/memory/IOPS/HTTP/mail) and
+        ``pa`` (coarser buckets, ~3h — database/container/toast disk size; the dashboard's own
+        panel description claims "every 1h", but the real cadence observed live is ~3h — trust
+        the data, not the label). Every numeric ``*_sum`` field is a **sum over the bucket**, not
+        an average — divide by the bucket's ``duration_sum`` (in **seconds**) to get a plottable
+        average, e.g. ``mem_user_sum / duration_sum`` MB. The bucket width itself **adapts to the
+        requested range** (confirmed live: ~300s over a 1-day window, ~1800s over the dashboard's
+        default 2-day window) — don't assume a fixed value. odoo.sh/Grafana itself never
+        re-buckets these series for a wider range or zoom level beyond that server-side width
+        choice (confirmed from the dashboard's own JSON definition) — any further re-aggregation
+        (e.g. scalidev's ``resolution`` parameter) is client-side only.
+
+        The route itself **ignores the requested window**: confirmed live (CLI and a raw
+        ``fetch()`` from the Monitor tab page itself) that ``pad`` data starts exactly 24h
+        before ``start_ts`` and continues past ``end_ts`` all the way to "now", regardless of
+        how far in the past ``end_ts`` is. This method filters the response to the requested
+        ``[start, end)`` window before returning it, and flags the last ``pad`` row as
+        ``"partial": true`` when its ``duration_sum`` is below the response's own nominal bucket
+        width (can happen at the edge of "now", or past a retention/aggregation boundary — see
+        :meth:`get_monitoring_annotations`).
+
+        Returns ``{"build_id": int, "pad": [...], "pa": [...]}`` (only the requested ``scopes``
+        are present), each series a list of per-bucket dicts as returned by Grafana, ready to
+        feed a chart with the exact same data as the Memory/CPU/IOPS/HTTP/Mails/Storage panels.
+        """
+        start_ts, end_ts = _to_epoch_ms(start), _to_epoch_ms(end)
+        with self._session() as client:
+            if build_id is None:
+                build_id = self._resolve_monitoring_build_id_checked(client, project, branch)
+            params = {"build_id": build_id, "start_ts": start_ts, "end_ts": end_ts}
+            result = {"build_id": build_id}
+            for scope in scopes:
+                rows = (self._app(client, "/_grafana/query/%s" % scope, params) or {}).get("data") or []
+                rows = [row for row in rows if start_ts <= row["time"] < end_ts]
+                durations = [row["duration_sum"] for row in rows if "duration_sum" in row]
+                if durations:
+                    # Bucket width adapts to the requested range (confirmed live: ~300s over a
+                    # 1-day window, ~1800s over the dashboard's default 2-day window) — derive the
+                    # nominal width from the response itself rather than assuming a fixed value.
+                    nominal = max(set(durations), key=durations.count)
+                    if rows[-1]["duration_sum"] < nominal:
+                        rows[-1] = dict(rows[-1], partial=True)
+                result[scope] = rows
+            self._save_cookies(client)
+            return result
+
+    def get_monitoring_snapshot(self, project, branch, build_id=None, redact=True):
+        """Return the Monitor tab's point-in-time snapshot for ``branch``.
+
+        Covers the Storage/Filestore/Database breakdown pie charts and the "odoo.log
+        statistics" row (error/warning/memory-limit/serialization-failure counts and the
+        slowest routes), by calling the same ``/_grafana/query/global`` route as the dashboard.
+
+        Unlike :meth:`get_monitoring_metrics`, **this ignores any notion of a selected time
+        range** — confirmed live by replaying the same query with different end timestamps and
+        getting an identical response: the panels are literally titled "Last 24h"/"Last 7
+        days" in Grafana and always mean exactly that, relative to *now*, not to a chosen
+        period. There is no way to get an equivalent snapshot for an arbitrary past day through
+        this endpoint; only :meth:`get_monitoring_metrics` (``pad``/``pa``) supports arbitrary
+        historical ranges. The dashboard's own panel descriptions say this data "is updated
+        every 24h for the production DB" — so it can lag reality by up to a day despite being
+        "now"-relative.
+
+        Returns ``{"database": [...], "storage": {...}, "filestore": [...], "log_counter_daily":
+        {...}, "log_counter_weekly": {...}, "slowest_routes_daily": {...},
+        "slowest_routes_weekly": {...}, "error_messages": {...}, "timestamp": str}``.
+        ``storage`` sizes (``filestore_size``/``database_size``/...) are converted from odoo.sh's
+        raw kilobytes (confirmed from the dashboard's own ``fieldConfig.unit: "kbytes"``) to
+        megabytes, in ``*_mb``-suffixed keys. ``database``/``filestore`` are lists of
+        ``{table/mimetype, size_mb, index_mb, toast_mb}``/``{mimetype, file_count, size_mb}``
+        dicts (parsed out of odoo.sh's mixed text/number keys) instead of odoo.sh's raw
+        ``"<table> (index=X MB,toast=Y MB)": size`` mapping. ``timestamp`` is ISO-8601 UTC.
+
+        ``slowest_routes_daily``/``slowest_routes_weekly`` route keys can carry a live request's
+        full query string (e.g. ``/auth_oauth/signin?access_token=...``), which has been observed
+        to include real OAuth tokens and end-user identities. ``redact=True`` (default) strips
+        the query string from every route key before returning. These dicts also carry a spurious
+        Grafana header row (``"Route": "Max execution time (Execution count)"``), dropped here.
+        """
+        with self._session() as client:
+            if build_id is None:
+                build_id = self._resolve_monitoring_build_id_checked(client, project, branch)
+            # start_ts/end_ts are required by the route but ignored server-side (see docstring);
+            # any value works, so a fixed recent window is passed for clarity.
+            now_ms = int(time.time() * 1000)
+            params = {"build_id": build_id, "start_ts": now_ms - 7 * 86400000, "end_ts": now_ms}
+            result = (self._app(client, "/_grafana/query/global", params) or [{}])[0]
+            self._save_cookies(client)
+
+        for key in ("slowest_routes_daily", "slowest_routes_weekly"):
+            routes = dict(result.get(key) or {})
+            routes.pop("Route", None)
+            result[key] = _redact_routes(routes) if redact else routes
+
+        storage = dict(result.get("storage") or {})
+        for key in ("filestore_size", "database_size", "logs_size", "remaining_size",
+                    "repositories_size", "sessions_size"):
+            if key in storage:
+                storage[key.replace("_size", "_mb")] = _kb_to_mb(storage.pop(key))
+        result["storage"] = storage
+
+        result["database"] = [_split_database_key(k, v) for k, v in (result.get("database") or {}).items()]
+        result["filestore"] = [_split_filestore_key(k, v) for k, v in (result.get("filestore") or {}).items()]
+
+        if "timestamp" in result:
+            result["timestamp"] = _to_iso_utc(result["timestamp"])
+        return result
+
+    def get_monitoring_annotations(self, project, branch, start, end, build_id=None):
+        """Return the Monitor tab's deploy/build annotations for ``branch`` over ``[start, end]``.
+
+        These are the vertical markers Grafana overlays on the time-series panels, fetched via
+        ``POST /_grafana/annotations`` with the same ``{build_id, start_ts, end_ts}`` params as
+        :meth:`get_monitoring_metrics` (confirmed live from the Monitor tab's own network
+        traffic — the generic Grafana public-dashboard annotations endpoint is a red herring
+        that never returns odoo.sh deploy markers). ``start``/``end`` accept a
+        :class:`datetime.datetime` or an epoch-milliseconds number.
+
+        Like :meth:`get_monitoring_metrics`, the route **ignores the requested window** —
+        confirmed live: a 2h window still returns retention notices from weeks earlier. This
+        method filters the response to ``[start, end)`` before returning it.
+
+        Returns a list of ``{"time": str (ISO UTC), "text": str, "color": str}``. ``text``
+        contains raw HTML (``<a>``/``<li>`` links to the GitHub commit/PR). Two kinds of
+        annotations are mixed together: real deploys (commit/PR info) and, with
+        ``color == RETENTION_NOTICE_COLOR`` (module constant, ``"#2596be"``), system notices that
+        the data before that point in time has been aggregated to a coarser resolution — not a
+        deploy, treat it as a retention boundary instead.
+        """
+        start_ts, end_ts = _to_epoch_ms(start), _to_epoch_ms(end)
+        with self._session() as client:
+            if build_id is None:
+                build_id = self._resolve_monitoring_build_id_checked(client, project, branch)
+            params = {"build_id": build_id, "start_ts": start_ts, "end_ts": end_ts}
+            result = self._app(client, "/_grafana/annotations", params) or {}
+            self._save_cookies(client)
+        annotations = result.get("annotations") or []
+        return [dict(a, time=_to_iso_utc(a["time"])) for a in annotations if start_ts <= a["time"] < end_ts]
 
     def wait_for_build(self, project, branch, after_build_id=None, commit=None,
                        timeout=1800, interval=10, on_start=None):
@@ -373,6 +599,36 @@ class OdooShClient:
                 raise NeedLogin(msg)
             raise RuntimeError(msg)
         return data.get("result")
+
+    def _resolve_monitoring_build_id(self, client, project, branch, build=None):
+        """Return the build id the Monitor tab resolves ``project``/``branch``/``build`` to.
+
+        Mirrors the dashboard's own ``/_grafana/search`` call. ``build=None`` (default)
+        resolves to the branch's *current* build — passing an explicit build number/commit is
+        not supported by this route (odoo.sh answers with a generic server error for anything
+        but the current build), so historical ranges are queried with the current build id too
+        (the metrics themselves remain available further back than that build's own start time).
+        """
+        res = self._app(client, "/_grafana/search", {"project": project, "branch": branch, "build": build})
+        if not res:
+            raise RuntimeError("could not resolve a monitoring build id for %r/%r" % (project, branch))
+        return res[0]
+
+    def _resolve_monitoring_build_id_checked(self, client, project, branch, build=None):
+        """Like :meth:`_resolve_monitoring_build_id`, but replaces odoo.sh's opaque ``SH-xxxxx``
+        server error with an explicit message when the branch doesn't exist or has no monitoring
+        build (e.g. a dev branch) — confirmed live on both cases.
+        """
+        try:
+            return self._resolve_monitoring_build_id(client, project, branch, build=build)
+        except RuntimeError:
+            info = self.get_branch(project, branch)
+            if info.get("error"):
+                raise ValueError("branch %r not found in project %r (available: %s)" % (
+                    branch, project, ", ".join(info.get("available") or []))) from None
+            if info.get("stage") == "dev":
+                raise ValueError("Monitor unavailable for dev branch %r (no monitoring build)" % branch) from None
+            raise
 
     def _repo(self, client, project):
         """Return the accessible odoo.sh repo dict for the ``project`` name.

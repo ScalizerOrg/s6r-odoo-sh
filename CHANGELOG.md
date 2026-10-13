@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.8
+
+- `get_monitoring_metrics(project, branch, start, end, build_id=None, scopes=("pad", "pa"))`:
+  the Monitor tab's time-series metrics (CPU, memory, IOPS, HTTP, mail — `pad`; database/
+  container/toast size — `pa`), fetched from odoo.sh's reverse-proxied Grafana instance
+  (`POST /_grafana/query/<scope>`) instead of scraping the rendered dashboard. `start`/`end`
+  accept a `datetime` or an epoch-milliseconds number and are enforced client-side on the
+  response (odoo.sh's own routes return more than asked). `*_sum` fields are sums over the
+  bucket, to be divided by `duration_sum` (seconds) for a plottable average; the last row is
+  flagged `"partial": true` when it doesn't cover a full bucket.
+- `get_monitoring_snapshot(project, branch, build_id=None, redact=True)`: the Monitor tab's
+  point-in-time snapshot (`POST /_grafana/query/global`) — storage/filestore/database
+  breakdown (sizes in MB), error/warning/memory-limit/serialization-failure counts, slowest
+  routes. Always relative to *now* ("Last 24h"/"Last 7 days"), regardless of any requested
+  range. `redact=True` (default) strips query strings from `slowest_routes_*` route keys,
+  which can carry live OAuth tokens and end-user identities straight from Odoo's own
+  request log.
+- `get_monitoring_annotations(project, branch, start, end, build_id=None)`: the Monitor tab's
+  deploy/build markers (`POST /_grafana/annotations`), filtered to `[start, end)`. Mixes real
+  deploys with system notices (`color == RETENTION_NOTICE_COLOR`) marking where data has been
+  aggregated to a coarser resolution.
+- All three raise a clear `ValueError` ("branch not found", with the available branches, or
+  "Monitor unavailable for dev branch") for an invalid or dev branch.
+
 ## 0.2.2
 
 - Port every dashboard call to odoo.sh's new `/app/*` JSON API. odoo.sh moved its

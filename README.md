@@ -157,6 +157,60 @@ apart — an inherent, documented limitation.) The download is a ZIP (`dump.sql`
 `filestore/`); the worker authorizes it from the session via a redirect, and prepared
 test dumps stay available for ~2h.
 
+## Monitoring (CPU, memory, IOPS, HTTP, logs)
+
+The Monitor tab is a reverse-proxied Grafana instance; these calls read its data directly
+instead of scraping the rendered dashboard — the same numbers, ready to feed your own chart.
+
+```bash
+s6r-odoo-sh --monitoring-metrics -p myproject BRANCH --from "2026-10-05" --to "2026-10-09"
+s6r-odoo-sh --monitoring-snapshot -p myproject BRANCH          # always "last 24h/7 days", see below
+s6r-odoo-sh --monitoring-annotations -p myproject BRANCH --from "2026-10-05" --to "2026-10-09"
+```
+
+```python
+from datetime import datetime, timezone
+
+metrics = client.get_monitoring_metrics(
+    "myproject", "BRANCH",
+    start=datetime(2026, 10, 5, tzinfo=timezone.utc),
+    end=datetime(2026, 10, 9, tzinfo=timezone.utc),
+)
+# metrics["pad"]: buckets (width adapts to the range, ~5min for a short one) —
+#   cpu_http_sum/cpu_pg_sum/.../mem_user_sum/mem_pg_sum, iops_read_total_sum/
+#   iops_write_total_sum, http_success_sum/http_error_sum/http_concurrency_max,
+#   mail_in_sum/mail_out_sum, duration_sum (in seconds). *_sum fields are SUMS over the
+#   bucket — divide by duration_sum for a plottable average, e.g.:
+mem_mb = [p["mem_user_sum"] / p["duration_sum"] for p in metrics["pad"]]
+# Already filtered to [start, end) — odoo.sh's own routes return far more than asked
+# (confirmed live: pad starts 24h before `start` and runs past `end` to "now").
+# metrics["pa"]: coarser buckets (~3h) — size_database_avg/size_container_avg/size_toast_avg
+#   (size_database_avg already includes the toast size).
+
+snapshot = client.get_monitoring_snapshot("myproject", "BRANCH")
+# snapshot["storage"]: {filestore_mb, database_mb, logs_mb, remaining_mb, repositories_mb,
+#   sessions_mb} — converted from odoo.sh's raw kilobytes.
+# snapshot["database"] / snapshot["filestore"]: lists of
+#   {table, size_mb, index_mb, toast_mb} / {mimetype, file_count, size_mb} dicts.
+# snapshot["log_counter_daily"]["memory_limit"], snapshot["slowest_routes_weekly"], ...
+
+annotations = client.get_monitoring_annotations(
+    "myproject", "BRANCH",
+    start=datetime(2026, 10, 5, tzinfo=timezone.utc),
+    end=datetime(2026, 10, 9, tzinfo=timezone.utc),
+)
+# [{"time": "2026-10-05T15:02:02+00:00", "text": "Commit made by <a ...", "color": "#E02F44"}, ...]
+# A "#2596be" entry is a retention notice ("data before this point has been aggregated"),
+# not a deploy — see s6r_odoo_sh.client.RETENTION_NOTICE_COLOR.
+```
+
+`get_monitoring_snapshot` **ignores any notion of a selected period** — its panels are
+Grafana's own "Last 24h"/"Last 7 days", always relative to *now*, never to an arbitrary past
+date (and the underlying data itself can lag up to 24h on odoo.sh's side). Only
+`get_monitoring_metrics`/`get_monitoring_annotations` support historical ranges. Route keys in
+`slowest_routes_daily`/`slowest_routes_weekly` are redacted of their query string by default
+(`redact=True`) since Odoo's own request log can carry live OAuth tokens there.
+
 ## License
 
 LGPL-3.0-or-later.
